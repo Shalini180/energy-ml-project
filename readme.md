@@ -1,13 +1,3 @@
-Understood — you want the README to be **more appealing / engaging**, while staying concise and focused.
-
-Below is a redesigned version that is:
-✅ Clearer
-✅ Visually structured
-✅ More engaging + scannable
-✅ Shorter + more inviting
-
----
-
 # 🌿 Carbon-Aware SQL Query Engine
 
 A proof-of-concept query engine that reduces carbon emissions by choosing **when** and **how** to run SQL workloads based on real-time grid conditions.
