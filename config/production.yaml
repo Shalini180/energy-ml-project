@@ -1,0 +1,22 @@
+# config/production.yaml - Simple version for hackathon
+
+app:
+  name: "Carbon-Aware Query Engine"
+  version: "0.1.0"
+
+database:
+  type: "duckdb"
+  path: "data/demo.db"
+
+carbon_api:
+  api_key: null  # Will use fallback patterns
+  zone: "US-CAL-CISO"
+  cache_minutes: 5
+  fallback_to_historical: true
+
+thresholds:
+  low_carbon: 250
+  high_carbon: 500
+
+logging:
+  level: "INFO"
