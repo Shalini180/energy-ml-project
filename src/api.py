@@ -1,17 +1,25 @@
 """FastAPI application for Energy ML API"""
 
-from fastapi import FastAPI, Depends, HTTPException, status
+import os
+from fastapi import FastAPI, Depends, HTTPException, status, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.security import APIKeyHeader
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 from typing import List, Optional
 from datetime import datetime, timedelta
 from pydantic import BaseModel, Field
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
-from ..db.database import get_db, init_db
-from ..db.models import QueryExecution, QueryUrgencyEnum, QueryStatusEnum
-from ..core.engine import CarbonAwareQueryEngine
-from ..optimizer.selector import QueryUrgency
+from src.db.database import get_db, init_db
+from src.db.models import QueryExecution, QueryUrgencyEnum, QueryStatusEnum
+from src.core.engine import CarbonAwareQueryEngine
+from src.optimizer.selector import QueryUrgency
+
+# Initialize rate limiter
+limiter = Limiter(key_func=get_remote_address)
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -20,13 +28,18 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# CORS middleware
+# Add rate limiter to app state
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# CORS middleware - restrictive for production
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:8501").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately for production
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "X-API-Key"],
 )
 
 
@@ -36,8 +49,28 @@ async def startup_event():
     init_db()
 
 
-# Security
-security = HTTPBearer()
+# Security - API Key Authentication
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+async def verify_api_key(api_key: str = Depends(api_key_header)):
+    """Verify API key from X-API-Key header"""
+    expected_api_key = os.getenv("ENERGY_ML_API_KEY")
+
+    if not expected_api_key:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="API key not configured on server",
+        )
+
+    if not api_key or api_key != expected_api_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing API key",
+            headers={"WWW-Authenticate": "ApiKey"},
+        )
+
+    return api_key
 
 
 # Pydantic models
@@ -96,6 +129,7 @@ class HealthResponse(BaseModel):
     status: str
     timestamp: datetime
     version: str
+    database: str
 
 
 # Endpoints
@@ -110,15 +144,40 @@ async def root():
 
 
 @app.get("/health", response_model=HealthResponse)
-async def health_check():
-    """Health check endpoint"""
-    return HealthResponse(
-        status="healthy", timestamp=datetime.utcnow(), version="1.0.0"
-    )
+@limiter.limit("60/minute")
+async def health_check(request: Request, db: Session = Depends(get_db)):
+    """Health check endpoint with database connectivity check"""
+    db_status = "disconnected"
+    overall_status = "unhealthy"
+
+    try:
+        # Test database connection with a simple query
+        db.execute(text("SELECT 1"))
+        db_status = "connected"
+        overall_status = "healthy"
+
+        return HealthResponse(
+            status=overall_status,
+            timestamp=datetime.utcnow(),
+            version="1.0.0",
+            database=db_status,
+        )
+    except Exception as e:
+        # Database connection failed
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database health check failed: {str(e)}",
+        )
 
 
 @app.post("/query/execute", response_model=QueryResponse)
-async def execute_query(request: QueryRequest, db: Session = Depends(get_db)):
+@limiter.limit("5/minute")
+async def execute_query(
+    req: Request,
+    request: QueryRequest,
+    db: Session = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
     """
     Execute a SQL query with carbon awareness
 
@@ -128,7 +187,7 @@ async def execute_query(request: QueryRequest, db: Session = Depends(get_db)):
     """
     try:
         # Create query execution record
-        from ..db.database import DatabaseManager
+        from src.db.database import DatabaseManager
 
         query_exec = DatabaseManager.create_query_execution(
             db=db,
@@ -195,11 +254,16 @@ async def execute_query(request: QueryRequest, db: Session = Depends(get_db)):
 
 
 @app.get("/query/history", response_model=List[QueryHistoryResponse])
+@limiter.limit("30/minute")
 async def get_query_history(
-    limit: int = 100, user_id: Optional[int] = None, db: Session = Depends(get_db)
+    request: Request,
+    limit: int = 100,
+    user_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
 ):
     """Get query execution history"""
-    from ..db.database import DatabaseManager
+    from src.db.database import DatabaseManager
 
     queries = DatabaseManager.get_query_history(db=db, user_id=user_id, limit=limit)
 
@@ -242,9 +306,15 @@ async def get_query_details(query_id: int, db: Session = Depends(get_db)):
 
 
 @app.get("/emissions/summary", response_model=EmissionsSummaryResponse)
-async def get_emissions_summary(days: int = 30, db: Session = Depends(get_db)):
+@limiter.limit("30/minute")
+async def get_emissions_summary(
+    request: Request,
+    days: int = 30,
+    db: Session = Depends(get_db),
+    api_key: str = Depends(verify_api_key),
+):
     """Get emissions summary statistics"""
-    from ..db.database import DatabaseManager
+    from src.db.database import DatabaseManager
 
     summary = DatabaseManager.get_emissions_summary(db=db, days=days)
 
@@ -254,7 +324,7 @@ async def get_emissions_summary(days: int = 30, db: Session = Depends(get_db)):
 @app.get("/carbon/current")
 async def get_current_carbon_intensity(zone: str = None):
     """Get current carbon intensity for a zone"""
-    from ..optimizer.carbon_provider import CarbonProvider
+    from src.optimizer.carbon_provider import CarbonProvider
 
     try:
         provider = CarbonProvider(zone=zone)
