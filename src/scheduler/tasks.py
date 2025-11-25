@@ -4,6 +4,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
 @celery_app.task
 def execute_deferred_query(query_id: int):
     """
