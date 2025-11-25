@@ -408,55 +408,79 @@ def main():
                         carbon_intensity = result.get("carbon_intensity_gco2_kwh", 0)
                         threshold = 400  # You can make this dynamic
 
-                        st.markdown("**Key Metrics:**")
-                        metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(
-                            4
-                        )
+                        st.markdown("### 📊 Execution Metrics")
 
-                        with metric_col1:
+                        # Row 1: Primary Metrics
+                        m_col1, m_col2, m_col3 = st.columns(3)
+                        with m_col1:
                             st.metric(
                                 "Carbon Intensity",
                                 f"{carbon_intensity:.0f} gCO₂/kWh",
+                                delta=(
+                                    f"{threshold - carbon_intensity:.0f} below threshold"
+                                    if carbon_intensity < threshold
+                                    else f"{carbon_intensity - threshold:.0f} above threshold"
+                                ),
+                                delta_color="inverse",
                             )
-                        with metric_col2:
+                        with m_col2:
                             st.metric(
                                 "Energy Consumed",
                                 f"{result.get('energy_joules', 0):.2f} J",
                             )
-                        with metric_col3:
+                        with m_col3:
                             st.metric(
                                 "Execution Time",
                                 f"{result.get('execution_time_ms', 0):.0f} ms",
                             )
-                        with metric_col4:
-                            forecast_unc = result.get(
-                                "forecast_uncertainty_gco2_kwh", 0
+
+                        # Row 2: Uncertainty & Advanced Metrics
+                        st.markdown("#### Uncertainty & Reliability")
+                        u_col1, u_col2, u_col3 = st.columns(3)
+
+                        forecast_unc = result.get("forecast_uncertainty_gco2_kwh", 0)
+                        energy_std = result.get("energy_std_dev_joules", 0)
+
+                        with u_col1:
+                            st.metric(
+                                "Forecast Interval (±)",
+                                (
+                                    f"{forecast_unc:.2f} gCO₂/kWh"
+                                    if forecast_unc
+                                    else "N/A"
+                                ),
+                                help="95% confidence interval for carbon intensity forecast",
                             )
-                            energy_std = result.get("energy_std_dev_joules", 0)
-                            if forecast_unc or energy_std:
-                                st.metric(
-                                    "Forecast Uncertainty",
-                                    (
-                                        f"{forecast_unc:.2f} gCO₂/kWh"
-                                        if forecast_unc
-                                        else "N/A"
-                                    ),
-                                )
-                                st.metric(
-                                    "Energy Std Dev",
-                                    f"{energy_std:.2f} J" if energy_std else "N/A",
-                                )
+                        with u_col2:
+                            st.metric(
+                                "Energy σ (Std Dev)",
+                                f"{energy_std:.2f} J" if energy_std else "N/A",
+                                help="Standard deviation of energy consumption across multiple runs",
+                            )
+                        with u_col3:
+                            st.metric(
+                                "Estimated Emissions",
+                                f"{result.get('estimated_emissions_gco2', 0):.4f} gCO₂",
+                            )
 
                         # Mathematical notation
                         if carbon_intensity and threshold:
-                            st.markdown("**Decision Formula:**")
+                            st.markdown("### 📐 Decision Logic")
+                            st.markdown(
+                                "The decision to execute or defer is based on the following logic, accounting for uncertainty:"
+                            )
+
                             if carbon_intensity > threshold:
                                 st.latex(
-                                    rf"CI  ({carbon_intensity:.0f}) > Threshold ({threshold}) \Rightarrow Consider Deferral"
+                                    rf"CI_{{forecast}} ({carbon_intensity:.0f}) - I_{{uncertainty}} ({forecast_unc:.1f}) > Threshold ({threshold}) \Rightarrow \text{{Defer}}"
                                 )
+                                if result.get("deferred"):
+                                    st.info(
+                                        "💡 **Insight:** Even with the lower bound of the forecast uncertainty, the carbon intensity is too high."
+                                    )
                             else:
                                 st.latex(
-                                    rf"CI ({carbon_intensity:.0f}) \leq Threshold ({threshold}) \Rightarrow Execute Now"
+                                    rf"CI_{{forecast}} ({carbon_intensity:.0f}) \leq Threshold ({threshold}) \Rightarrow \text{{Execute Now}}"
                                 )
 
                         st.metric(
