@@ -329,7 +329,7 @@ async def get_emissions_summary(
 @app.get("/carbon/current")
 async def get_current_carbon_intensity(zone: str = None):
     """Get current carbon intensity for a zone"""
-    from src.optimizer.carbon_provider import CarbonProvider
+    from src.optimizer.carbon_api import CarbonProvider
 
     try:
         provider = CarbonProvider(zone=zone)
