@@ -188,11 +188,11 @@ def create_carbon_intensity_chart(carbon_df, deferred_queries=None):
     if carbon_df.empty:
         return None
     fig = go.Figure()
-    # Main carbon intensity line (fixed column name)
+    # Main carbon intensity line (fixed column name to match JSON data)
     fig.add_trace(
         go.Scatter(
             x=carbon_df["timestamp"],
-            y=carbon_df["carbonIntensity"],
+            y=carbon_df["carbon_intensity"],
             mode="lines+markers",
             name="Carbon Intensity",
             line=dict(color="#2E7D32", width=2),
@@ -218,7 +218,7 @@ def create_carbon_intensity_chart(carbon_df, deferred_queries=None):
             deferred_intensities = []
             for dt in deferred_times:
                 idx = (carbon_df["timestamp"] - dt).abs().idxmin()
-                deferred_intensities.append(carbon_df.loc[idx, "carbonIntensity"])
+                deferred_intensities.append(carbon_df.loc[idx, "carbon_intensity"])
             fig.add_trace(
                 go.Scatter(
                     x=deferred_times,
