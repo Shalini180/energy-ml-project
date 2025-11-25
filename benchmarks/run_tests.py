@@ -5,22 +5,33 @@ import random
 import time
 from datetime import datetime, timedelta
 import logging
+from dotenv import load_dotenv
+
+# Load environment variables FIRST
+load_dotenv()
+
+# Configure database URL for benchmarks BEFORE importing database modules
+if "BENCHMARK_DB_URL" in os.environ:
+    os.environ["DATABASE_URL"] = os.environ["BENCHMARK_DB_URL"]
 
 # Add project root to path
 sys.path.append(os.getcwd())
-
-from sqlalchemy.orm import Session
-from src.db.database import init_db, get_db_context, DatabaseManager, engine
-from src.core.compiler import MultiVariantCompiler, ExecutionStrategy, QueryUrgency
-from src.core.executor import QueryExecutor
-from src.optimizer.carbon_api import CarbonIntensity
-from src.monitoring.metrics import QueryMetrics
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+if "BENCHMARK_DB_URL" in os.environ:
+    logger.info(f"Using benchmark database: {os.environ['BENCHMARK_DB_URL']}")
+
+# NOW import database modules (after DATABASE_URL is set)
+from sqlalchemy.orm import Session
+from src.db.database import init_db, get_db_context, DatabaseManager, engine
+from src.core.compiler import MultiVariantCompiler, ExecutionStrategy
+from src.core.executor import QueryExecutor
+from src.optimizer.carbon_api import CarbonIntensity
 
 # --- 1. Data Generation ---
 
@@ -125,6 +136,11 @@ def run_benchmarks():
     compiler = MultiVariantCompiler()
     executor = QueryExecutor()
 
+    # Initialize Profiler
+    from src.core.profiler import EnergyProfiler
+
+    profiler = EnergyProfiler()
+
     # We need to populate the DuckDB instance.
     def populate_data(conn):
         # Create Tables
@@ -166,6 +182,23 @@ def run_benchmarks():
         "Strategy C (Balanced Hybrid)": ExecutionStrategy.EFFICIENT,
     }
 
+    # Create default user if not exists
+    from src.db.models import User
+
+    with get_db_context() as db:
+        user = db.query(User).filter(User.id == 1).first()
+        if not user:
+            user = User(
+                id=1,
+                email="benchmark@example.com",
+                username="benchmark_user",
+                hashed_password="hashed_password",
+                full_name="Benchmark User",
+            )
+            db.add(user)
+            db.commit()
+            logger.info("Created benchmark user")
+
     with get_db_context() as db:
         for q_idx, sql in enumerate(QUERIES):
             logger.info(f"Running Query {q_idx + 1}/{len(QUERIES)}")
@@ -179,24 +212,37 @@ def run_benchmarks():
                 conn = compiler.get_connection(variant)
                 populate_data(conn)
 
-                # Execute
-                start_time = time.time()
-                try:
+                # Execute with uncertainty profiling
+                # We'll profile the execution function
+                def execute_query():
                     # Use the optimized SQL
                     query_to_run = variant.sql or sql
-                    result = conn.execute(query_to_run).fetchall()
+                    return conn.execute(query_to_run).fetchall()
+
+                try:
+                    # Run 5 iterations to get uncertainty
+                    result_data, metrics, energy_std_dev = (
+                        profiler.profile_with_uncertainty(execute_query, iterations=5)
+                    )
                     success = True
+
+                    # Use profiled metrics
+                    duration_ms = metrics.duration_ms
+                    energy_j = metrics.energy_joules
+
                 except Exception as e:
                     logger.error(f"Query failed: {e}")
                     success = False
-
-                duration_ms = (time.time() - start_time) * 1000
+                    duration_ms = 0
+                    energy_j = 0
+                    energy_std_dev = 0
 
                 # Metrics
-                # Mock energy for benchmark if not available from system
-                energy_j = variant.estimated_energy or random.uniform(10, 100)
                 carbon_intensity = 300  # Mock or get from history
                 emissions_g = (energy_j / 3.6e6) * carbon_intensity
+
+                # Get forecast uncertainty (mock for benchmark)
+                forecast_uncertainty = 15.0  # Mock value from CarbonAPI logic
 
                 # Log to DB
                 if success:
@@ -220,8 +266,29 @@ def run_benchmarks():
                         decision_reason=f"Benchmark: {strat_name}",
                     )
 
+                    # Update QueryExecution for forecast uncertainty
+                    from src.db.models import QueryExecution, QueryMetrics
+
+                    db.query(QueryExecution).filter(
+                        QueryExecution.id == query_exec.id
+                    ).update({"forecast_uncertainty_gco2_kwh": forecast_uncertainty})
+
+                    # Update QueryMetrics for energy std dev
+                    metric_record = (
+                        db.query(QueryMetrics)
+                        .filter(QueryMetrics.query_id == query_exec.id)
+                        .first()
+                    )
+                    if not metric_record:
+                        metric_record = QueryMetrics(query_id=query_exec.id)
+                        db.add(metric_record)
+
+                    metric_record.energy_std_dev_joules = energy_std_dev
+
+                    db.commit()
+
                     logger.info(
-                        f"  {strat_name}: {duration_ms:.2f}ms, {emissions_g:.4f}gCO2"
+                        f"  {strat_name}: {duration_ms:.2f}ms, {emissions_g:.4f}gCO2, σ={energy_std_dev:.2f}J"
                     )
 
     logger.info("Benchmarks Completed.")

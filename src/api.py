@@ -1,4 +1,4 @@
-"""FastAPI application for Energy ML API"""
+# FastAPI application for Energy ML API
 
 import os
 from fastapi import FastAPI, Depends, HTTPException, status, Request
@@ -14,7 +14,12 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
 from src.db.database import get_db, init_db
-from src.db.models import QueryExecution, QueryUrgencyEnum, QueryStatusEnum
+from src.db.models import (
+    QueryExecution,
+    QueryUrgencyEnum,
+    QueryStatusEnum,
+    QueryMetrics,
+)
 from src.core.engine import CarbonAwareQueryEngine
 from src.optimizer.selector import QueryUrgency
 
@@ -42,13 +47,6 @@ app.add_middleware(
     allow_headers=["Content-Type", "X-API-Key"],
 )
 
-
-# Initialize database on startup
-@app.on_event("startup")
-async def startup_event():
-    init_db()
-
-
 # Security - API Key Authentication
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
@@ -56,20 +54,17 @@ api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 async def verify_api_key(api_key: str = Depends(api_key_header)):
     """Verify API key from X-API-Key header"""
     expected_api_key = os.getenv("ENERGY_ML_API_KEY")
-
     if not expected_api_key:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="API key not configured on server",
         )
-
     if not api_key or api_key != expected_api_key:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing API key",
             headers={"WWW-Authenticate": "ApiKey"},
         )
-
     return api_key
 
 
@@ -104,6 +99,9 @@ class QueryResponse(BaseModel):
     deferred: bool = False
     scheduled_at: Optional[datetime] = None
     result: Optional[dict] = None
+    # New uncertainty fields
+    forecast_uncertainty_gco2_kwh: Optional[float] = None
+    energy_std_dev_joules: Optional[float] = None
 
 
 class QueryHistoryResponse(BaseModel):
@@ -149,13 +147,10 @@ async def health_check(request: Request, db: Session = Depends(get_db)):
     """Health check endpoint with database connectivity check"""
     db_status = "disconnected"
     overall_status = "unhealthy"
-
     try:
-        # Test database connection with a simple query
         db.execute(text("SELECT 1"))
         db_status = "connected"
         overall_status = "healthy"
-
         return HealthResponse(
             status=overall_status,
             timestamp=datetime.utcnow(),
@@ -163,7 +158,6 @@ async def health_check(request: Request, db: Session = Depends(get_db)):
             database=db_status,
         )
     except Exception as e:
-        # Database connection failed
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Database health check failed: {str(e)}",
@@ -178,13 +172,7 @@ async def execute_query(
     db: Session = Depends(get_db),
     api_key: str = Depends(verify_api_key),
 ):
-    """
-    Execute a SQL query with carbon awareness
-
-    - **query**: SQL query to execute
-    - **urgency**: Query urgency level (low, medium, high, critical)
-    - **explain**: Whether to include execution explanation
-    """
+    """Execute a SQL query with carbon awareness"""
     try:
         # Create query execution record
         from src.db.database import DatabaseManager
@@ -195,10 +183,8 @@ async def execute_query(
             urgency=request.urgency,
             user_id=request.user_id,
         )
-
         # Initialize engine
         engine = CarbonAwareQueryEngine()
-
         # Map urgency string to enum
         urgency_map = {
             "low": QueryUrgency.LOW,
@@ -206,15 +192,13 @@ async def execute_query(
             "high": QueryUrgency.HIGH,
             "critical": QueryUrgency.CRITICAL,
         }
-
         # Execute query
         result, metrics, decision = engine.execute_query(
             query=request.query,
             urgency=urgency_map.get(request.urgency.lower(), QueryUrgency.MEDIUM),
             explain=request.explain,
         )
-
-        # Update database with results
+        # Update metrics in DB
         DatabaseManager.update_query_metrics(
             db=db,
             query_id=query_exec.id,
@@ -225,13 +209,20 @@ async def execute_query(
             plan=decision.selected_plan,
             decision_reason=decision.reason,
         )
-
-        # Check if query was deferred
+        # Retrieve uncertainty values from DB
+        qe = db.query(QueryExecution).filter(QueryExecution.id == query_exec.id).first()
+        qm = (
+            db.query(QueryMetrics)
+            .filter(QueryMetrics.query_id == query_exec.id)
+            .first()
+        )
+        forecast_uncertainty = getattr(qe, "forecast_uncertainty_gco2_kwh", None)
+        energy_std_dev = getattr(qm, "energy_std_dev_joules", None)
+        # Check deferral
         deferred = decision.action == "defer"
         scheduled_at = None
         if deferred:
             scheduled_at = datetime.utcnow() + timedelta(minutes=decision.defer_minutes)
-
         return QueryResponse(
             query_id=query_exec.id,
             status="deferred" if deferred else "completed",
@@ -244,8 +235,9 @@ async def execute_query(
             deferred=deferred,
             scheduled_at=scheduled_at,
             result=result if not deferred else None,
+            forecast_uncertainty_gco2_kwh=forecast_uncertainty,
+            energy_std_dev_joules=energy_std_dev,
         )
-
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -266,7 +258,6 @@ async def get_query_history(
     from src.db.database import DatabaseManager
 
     queries = DatabaseManager.get_query_history(db=db, user_id=user_id, limit=limit)
-
     return [
         QueryHistoryResponse(
             id=q.id,
@@ -286,13 +277,11 @@ async def get_query_history(
 async def get_query_details(query_id: int, db: Session = Depends(get_db)):
     """Get details of a specific query execution"""
     query = db.query(QueryExecution).filter(QueryExecution.id == query_id).first()
-
     if not query:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Query with ID {query_id} not found",
         )
-
     return QueryHistoryResponse(
         id=query.id,
         query_text=query.query_text,
@@ -303,6 +292,23 @@ async def get_query_details(query_id: int, db: Session = Depends(get_db)):
         created_at=query.created_at,
         executed_at=query.executed_at,
     )
+
+
+@app.get("/metrics/uncertainty/{query_id}")
+async def get_uncertainty_metrics(
+    query_id: int, db: Session = Depends(get_db), api_key: str = Depends(verify_api_key)
+):
+    """Return forecast uncertainty and energy std dev for a given query execution"""
+    qe = db.query(QueryExecution).filter(QueryExecution.id == query_id).first()
+    qm = db.query(QueryMetrics).filter(QueryMetrics.query_id == query_id).first()
+    if not qe or not qm:
+        raise HTTPException(status_code=404, detail="Metrics not found for query_id")
+    return {
+        "forecast_uncertainty_gco2_kwh": getattr(
+            qe, "forecast_uncertainty_gco2_kwh", None
+        ),
+        "energy_std_dev_joules": getattr(qm, "energy_std_dev_joules", None),
+    }
 
 
 @app.get("/emissions/summary", response_model=EmissionsSummaryResponse)
@@ -317,7 +323,6 @@ async def get_emissions_summary(
     from src.db.database import DatabaseManager
 
     summary = DatabaseManager.get_emissions_summary(db=db, days=days)
-
     return EmissionsSummaryResponse(**summary)
 
 
@@ -329,7 +334,6 @@ async def get_current_carbon_intensity(zone: str = None):
     try:
         provider = CarbonProvider(zone=zone)
         intensity = provider.get_current_intensity()
-
         return {
             "zone": provider.zone,
             "carbon_intensity_gco2_kwh": intensity,

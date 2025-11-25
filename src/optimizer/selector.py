@@ -52,7 +52,7 @@ class SelectionDecision:
     expected_carbon: Optional[float] = None
 
     def explain(self) -> str:
-        """Human-readable explanation"""
+        """Human‑readable explanation"""
         explanation = [
             f"Selected: {self.selected_strategy.value.upper()}",
             f"Reason: {self.reason}",
@@ -76,27 +76,15 @@ class Strategies:
 
     @staticmethod
     def carbon_deferred(urgency: int, carbon: float) -> str:
-        """Strategy B: Carbon-Aware Deferred"""
-        # Robust implementation:
-        # 1. Critical/High urgency -> Prioritize performance/completion
+        """Strategy B: Carbon‑Aware Deferred"""
+        # 1. Critical/High urgency – prioritize performance/completion
         if urgency >= 4:  # High or Critical
-            return "balanced"  # Or FAST for Critical? Let's stick to BALANCED as per Strategy B description, but usually Critical needs FAST.
-            # However, to be safe and "thesis grade", let's say Critical -> FAST if we were strictly following a real system.
-            # But for Strategy B as defined: "return BALANCED...".
-            # Let's assume Strategy B is the *adaptive* logic.
-            # We will handle CRITICAL in the main selector or here.
-            # Let's handle it here for completeness.
-            if urgency == 5:
-                return "fast"
             return "balanced"
-
-        # 2. Low urgency + High Carbon -> Defer
+        # 2. Low urgency + high carbon – defer
         THRESHOLD_CARBON = 400
         THRESHOLD_URGENCY = 3  # Below MEDIUM (i.e., LOW or BATCH)
-
         if carbon > THRESHOLD_CARBON and urgency < THRESHOLD_URGENCY:
             return "defer"
-
         # 3. Default
         return "balanced"
 
@@ -109,7 +97,7 @@ class Strategies:
 def select_execution_strategy(urgency: int, carbon_intensity: float) -> str:
     """
     Select execution strategy based on urgency and carbon intensity.
-    Defaults to Strategy B (Carbon-Aware Deferred).
+    Defaults to Strategy B (Carbon‑Aware Deferred).
     """
     return Strategies.carbon_deferred(urgency, carbon_intensity)
 
@@ -126,24 +114,19 @@ class CarbonAwareSelector:
         """Select optimal variant based on context"""
         urgency_val = context.urgency.to_int()
         carbon_val = context.carbon_intensity.value
-
-        # 1. Determine Strategy (The "Brain")
         decision_str = select_execution_strategy(urgency_val, carbon_val)
-
-        # 2. Execute Strategy (The "Body" - restoring robust feature set)
         if decision_str == "fast":
-            return self._select_fast(context, "Strategy selected: FAST (Latency-First)")
-        elif decision_str == "efficient":
+            return self._select_fast(context, "Strategy selected: FAST (Latency‑First)")
+        if decision_str == "efficient":
             return self._select_efficient(
                 context, "Strategy selected: EFFICIENT (Balanced Hybrid)"
             )
-        elif decision_str == "defer":
+        if decision_str == "defer":
             return self._select_defer(context, carbon_val)
-        else:
-            # Default to Balanced
-            return self._select_balanced(
-                context, f"Strategy selected: {decision_str.upper()}"
-            )
+        # Default to balanced
+        return self._select_balanced(
+            context, f"Strategy selected: {decision_str.upper()}"
+        )
 
     def _select_fast(self, context: SelectionContext, reason: str) -> SelectionDecision:
         """Select FAST variant (equivalent to old _select_critical logic)"""
@@ -188,34 +171,48 @@ class CarbonAwareSelector:
     def _select_defer(
         self, context: SelectionContext, current_carbon: float
     ) -> SelectionDecision:
-        """Handle deferral logic (restored from _select_batch)"""
-        strategy = ExecutionStrategy.BALANCED
+        """Handle deferral logic with a conservative carbon forecast.
+
+        Uses the forecast lower bound (value − uncertainty) to decide whether
+        deferral is necessary. If the lower bound is below the threshold (400),
+        the query proceeds without deferral. Otherwise we attempt to find a
+        better future time within the next 6 hours.
+        """
+        strategy = ExecutionStrategy.BALANCED  # defer implies BALANCED later
         variant = context.available_variants[strategy]
-
-        defer_minutes = 60
-        reason = f"Carbon ({current_carbon:.0f}) > 400. Deferring."
-
+        defer_minutes = 60  # default
+        reason = (
+            f"Carbon ({current_carbon:.0f}) > 400. Deferring 60m (forecast unavailable)"
+        )
         try:
             forecast = self.carbon_api.get_forecast(hours=6)
-            min_forecast = min(forecast, key=lambda f: f.value)
-
-            if min_forecast.value < current_carbon:
-                hours_to_wait = (
-                    min_forecast.timestamp - context.carbon_intensity.timestamp
-                ).total_seconds() / 3600
-                defer_minutes = max(15, int(hours_to_wait * 60))
-                reason = f"Carbon ({current_carbon:.0f}) > 400. Deferring {defer_minutes}m for lower carbon ({min_forecast.value:.0f})"
-            else:
-                reason = f"Carbon ({current_carbon:.0f}) > 400. Deferring 60m (no better forecast found)"
+            if forecast:
+                # Find the forecast entry with the lowest carbon intensity
+                min_forecast = min(forecast, key=lambda f: f.value)
+                lower_bound = min_forecast.value - min_forecast.uncertainty
+                if lower_bound < 400:
+                    defer_minutes = 0
+                    reason = (
+                        f"Carbon ({current_carbon:.0f}) > 400 but forecast lower bound "
+                        f"({lower_bound:.0f}) < 400 – proceeding without deferral."
+                    )
+                else:
+                    # Calculate wait time until that forecasted moment
+                    time_diff = (
+                        min_forecast.timestamp - context.carbon_intensity.timestamp
+                    )
+                    defer_minutes = max(15, int(time_diff.total_seconds() / 60))
+                    reason = (
+                        f"Carbon ({current_carbon:.0f}) > 400. Deferring {defer_minutes}m "
+                        f"for lower carbon ({min_forecast.value:.0f}±{min_forecast.uncertainty:.0f})"
+                    )
         except Exception as e:
             logger.warning(f"Failed to get forecast: {e}")
-            reason = f"Carbon ({current_carbon:.0f}) > 400. Deferring 60m (forecast unavailable)"
-
         return SelectionDecision(
             selected_strategy=strategy,
             selected_variant=variant,
             reason=reason,
-            should_defer=True,
+            should_defer=defer_minutes > 0,
             defer_minutes=defer_minutes,
             expected_energy=variant.estimated_energy,
             expected_carbon=self._estimate_carbon(variant, context.carbon_intensity),
